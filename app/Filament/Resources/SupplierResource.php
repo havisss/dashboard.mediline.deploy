@@ -1,0 +1,150 @@
+<?php
+
+namespace App\Filament\Resources;
+
+use App\Filament\Resources\SupplierResource\Pages;
+use App\Models\Supplier;
+use Filament\Forms;
+use Filament\Forms\Form;
+use Filament\Notifications\Notification;
+use Filament\Resources\Resource;
+use Filament\Tables;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Collection;
+
+class SupplierResource extends Resource
+{
+    protected static ?string $model = Supplier::class;
+
+    protected static ?string $navigationIcon = 'heroicon-o-truck';
+
+    protected static ?string $navigationGroup = 'Master Data';
+
+    protected static ?int $navigationSort = 3;
+
+    public static function form(Form $form): Form
+    {
+        return $form
+            ->schema([
+                Forms\Components\TextInput::make('name')
+                    ->required()
+                    ->maxLength(255),
+                Forms\Components\TextInput::make('contact_person')
+                    ->maxLength(255),
+                Forms\Components\TextInput::make('phone')
+                    ->tel()
+                    ->maxLength(255),
+                Forms\Components\TextInput::make('email')
+                    ->email()
+                    ->maxLength(255),
+                Forms\Components\Textarea::make('address')
+                    ->columnSpanFull(),
+                Forms\Components\TextInput::make('tax_id')
+                    ->maxLength(255),
+                Forms\Components\TextInput::make('top_days')
+                    ->label('Term of Payment (Hari)')
+                    ->numeric()
+                    ->minValue(0)
+                    ->default(0)
+                    ->dehydrateStateUsing(fn ($state): int => max(0, (int) ($state ?? 0))),
+                Forms\Components\Toggle::make('is_active')
+                    ->default(true)
+                    ->required(),
+                Forms\Components\Fieldset::make('Pengaturan OCR (Otomasi Faktur)')
+                    ->schema([
+                        Forms\Components\TextInput::make('ocr_invoice_keyword')
+                            ->label('Kata Kunci Nomor Faktur')
+                            ->placeholder('Cth: No. Faktur')
+                            ->helperText('Label tepat sebelum nomor faktur (tidak sensitif huruf besar/kecil).')
+                            ->maxLength(255),
+                        Forms\Components\TextInput::make('ocr_date_keyword')
+                            ->label('Kata Kunci Tanggal')
+                            ->placeholder('Cth: Tgl Faktur')
+                            ->helperText('Label tepat sebelum tanggal faktur.')
+                            ->maxLength(255),
+                        Forms\Components\TextInput::make('ocr_subtotal_keyword')
+                            ->label('Kata Kunci Subtotal')
+                            ->placeholder('Cth: Sub Total')
+                            ->helperText('Label tepat sebelum nominal subtotal.')
+                            ->maxLength(255),
+                        Forms\Components\TextInput::make('ocr_total_keyword')
+                            ->label('Kata Kunci Total Tagihan')
+                            ->placeholder('Cth: Total Faktur')
+                            ->helperText('Label tepat sebelum nominal total tagihan.')
+                            ->maxLength(255),
+                    ])
+                    ->columns(2),
+            ]);
+    }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                Tables\Columns\TextColumn::make('name')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('contact_person')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('phone')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('email')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('tax_id')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('top_days')
+                    ->label('TOP (Hari)')
+                    ->numeric()
+                    ->sortable(),
+                Tables\Columns\IconColumn::make('is_active')
+                    ->boolean(),
+                Tables\Columns\TextColumn::make('created_at')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
+                Tables\Columns\TextColumn::make('updated_at')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
+            ])
+            ->filters([
+                //
+            ])
+            ->actions([
+                Tables\Actions\EditAction::make(),
+            ])
+            ->bulkActions([
+                Tables\Actions\BulkActionGroup::make([
+                    Tables\Actions\DeleteBulkAction::make()
+                        ->before(function (Tables\Actions\DeleteBulkAction $action, Collection $records): void {
+                            $hasInvoices = $records->contains(fn (Supplier $record): bool => $record->inboundInvoices()->exists());
+
+                            if ($hasInvoices) {
+                                Notification::make()
+                                    ->title('Tidak dapat menghapus supplier')
+                                    ->body('Satu atau lebih supplier yang dipilih masih memiliki histori faktur pembelian. Nonaktifkan status aktif sebagai gantinya.')
+                                    ->danger()
+                                    ->send();
+
+                                $action->cancel();
+                            }
+                        }),
+                ]),
+            ]);
+    }
+
+    public static function getRelations(): array
+    {
+        return [
+            //
+        ];
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => Pages\ListSuppliers::route('/'),
+            'create' => Pages\CreateSupplier::route('/create'),
+            'edit' => Pages\EditSupplier::route('/{record}/edit'),
+        ];
+    }
+}
