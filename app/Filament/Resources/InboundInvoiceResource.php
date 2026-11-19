@@ -237,6 +237,10 @@ class InboundInvoiceResource extends Resource
 
     public static function processOcrScan(mixed $fileState, int $supplierId, Forms\Set $set, Forms\Get $get): void
     {
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(120);
+        }
+
         $supplier = Supplier::find($supplierId);
         if (! $supplier) {
             return;
@@ -251,46 +255,89 @@ class InboundInvoiceResource extends Resource
 
         try {
             $mimeType = self::detectFileMimeType($filePath, $originalFilename);
-            $usedLocalTesseract = false;
-            $text = self::extractOcrText($filePath, $mimeType, 4, $originalFilename, $usedLocalTesseract);
+            $driver = strtolower(trim((string) config('services.ocr.driver', 'auto')));
+            $geminiKey = trim((string) config('services.ocr.gemini_api_key', ''));
+            $parsed = null;
+            $text = '';
 
-            if (blank($text)) {
-                Log::info("OCR Extracted empty text for {$filePath}");
+            // 1. Untuk PDF digital, coba baca teks lokal dulu via Smalot PDFParser (gratis, cepat)
+            if ($mimeType === 'application/pdf') {
+                try {
+                    $pdfParser = new Parser;
+                    $pdf = $pdfParser->parseFile($filePath);
+                    $pdfText = trim($pdf->getText());
 
-                Notification::make()
-                    ->title('Teks faktur tidak terbaca')
-                    ->body('OCR tidak menemukan teks pada file yang diunggah.')
-                    ->warning()
-                    ->send();
-
-                return;
+                    if ($pdfText !== '') {
+                        $text = $pdfText;
+                        $parsed = self::parseOcrInvoiceData($text, $supplier);
+                    }
+                } catch (Throwable $e) {
+                    Log::warning('PDF text extraction fallback to OCR: '.$e->getMessage());
+                }
             }
 
-            Log::info("OCR Extracted Text:\n".$text);
+            // 2. Untuk gambar (JPG/PNG) atau PDF scan tanpa lapisan teks: utamakan Gemini Flash API jika aktif
+            $usedGemini = false;
+            if ($parsed === null && in_array($driver, ['auto', 'gemini'], true) && $geminiKey !== '' && in_array($mimeType, ['application/pdf', 'image/jpeg', 'image/png'], true)) {
+                try {
+                    $geminiResult = self::extractInvoiceViaGemini($filePath, $mimeType, $supplier, $geminiKey);
+                    $parsed = $geminiResult['parsed'];
+                    $text = $geminiResult['raw_text'];
+                    $usedGemini = true;
+                } catch (Throwable $geminiException) {
+                    Log::warning('Gemini OCR error: '.$geminiException->getMessage());
 
-            $parsed = self::parseOcrInvoiceData($text, $supplier);
-
-            $needsFallbackPass = $usedLocalTesseract
-                && in_array($mimeType, ['image/jpeg', 'image/png'], true)
-                && (($supplier->ocr_invoice_keyword && $parsed['invoice_number'] === null)
-                    || ($supplier->ocr_date_keyword && $parsed['issue_date'] === null)
-                    || ($supplier->ocr_total_keyword && $parsed['total_amount'] === null));
-
-            if ($needsFallbackPass) {
-                $fallbackText = self::extractOcrText($filePath, $mimeType, 3, $originalFilename);
-                if (filled($fallbackText)) {
-                    $fallbackParsed = self::parseOcrInvoiceData($fallbackText, $supplier);
-                    $parsed['invoice_number'] ??= $fallbackParsed['invoice_number'];
-                    $parsed['issue_date'] ??= $fallbackParsed['issue_date'];
-                    $parsed['due_date'] ??= $fallbackParsed['due_date'];
-                    $parsed['subtotal_amount'] ??= $fallbackParsed['subtotal_amount'];
-                    $parsed['total_amount'] ??= $fallbackParsed['total_amount'];
-
-                    if (empty($parsed['items']) && ! empty($fallbackParsed['items'])) {
-                        $parsed['items'] = $fallbackParsed['items'];
+                    if ($driver === 'gemini' || trim((string) config('services.ocr.ocrspace_api_key', '')) === '') {
+                        if (! self::canRunLocalTesseract() || $driver === 'gemini' || $mimeType === 'application/pdf') {
+                            throw new RuntimeException('Gemini OCR gagal: '.$geminiException->getMessage(), previous: $geminiException);
+                        }
                     }
                 }
             }
+
+            // 3. Fallback ke OCR.space / Tesseract lokal bila Gemini tidak aktif
+            if ($parsed === null) {
+                $usedLocalTesseract = false;
+                $text = self::extractOcrText($filePath, $mimeType, 4, $originalFilename, $usedLocalTesseract);
+
+                if (blank($text)) {
+                    Log::info("OCR Extracted empty text for {$filePath}");
+
+                    Notification::make()
+                        ->title('Teks faktur tidak terbaca')
+                        ->body('OCR tidak menemukan teks pada file yang diunggah.')
+                        ->warning()
+                        ->send();
+
+                    return;
+                }
+
+                $parsed = self::parseOcrInvoiceData($text, $supplier);
+
+                $needsFallbackPass = $usedLocalTesseract
+                    && in_array($mimeType, ['image/jpeg', 'image/png'], true)
+                    && (($supplier->ocr_invoice_keyword && $parsed['invoice_number'] === null)
+                        || ($supplier->ocr_date_keyword && $parsed['issue_date'] === null)
+                        || ($supplier->ocr_total_keyword && $parsed['total_amount'] === null));
+
+                if ($needsFallbackPass) {
+                    $fallbackText = self::extractOcrText($filePath, $mimeType, 3, $originalFilename);
+                    if (filled($fallbackText)) {
+                        $fallbackParsed = self::parseOcrInvoiceData($fallbackText, $supplier);
+                        $parsed['invoice_number'] ??= $fallbackParsed['invoice_number'];
+                        $parsed['issue_date'] ??= $fallbackParsed['issue_date'];
+                        $parsed['due_date'] ??= $fallbackParsed['due_date'];
+                        $parsed['subtotal_amount'] ??= $fallbackParsed['subtotal_amount'];
+                        $parsed['total_amount'] ??= $fallbackParsed['total_amount'];
+
+                        if (empty($parsed['items']) && ! empty($fallbackParsed['items'])) {
+                            $parsed['items'] = $fallbackParsed['items'];
+                        }
+                    }
+                }
+            }
+
+            Log::info('OCR Extracted Text ('.($usedGemini ? 'Gemini' : 'Parser')."):\n".$text);
 
             $matchedFields = [];
 
@@ -475,13 +522,12 @@ class InboundInvoiceResource extends Resource
 
     public static function canRunLocalTesseract(): bool
     {
-        if (! function_exists('proc_open')) {
-            return false;
-        }
-
         $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
-        if (in_array('proc_open', $disabled, true)) {
-            return false;
+
+        foreach (['proc_open', 'exec', 'system'] as $requiredFunction) {
+            if (! function_exists($requiredFunction) || in_array($requiredFunction, $disabled, true)) {
+                return false;
+            }
         }
 
         return self::resolveTesseractExecutable() !== null;
@@ -513,24 +559,39 @@ class InboundInvoiceResource extends Resource
         }
 
         $driver = strtolower(trim((string) config('services.ocr.driver', 'auto')));
+        $geminiKey = trim((string) config('services.ocr.gemini_api_key', ''));
         $ocrSpaceKey = trim((string) config('services.ocr.ocrspace_api_key', ''));
-        $ocrSpaceError = null;
+        $cloudError = null;
 
-        // 2. Cloud OCR via OCR.space API (mendukung JPG, PNG, dan PDF hasil scan tanpa binary server)
-        if (in_array($driver, ['auto', 'ocrspace'], true) && $ocrSpaceKey !== '') {
+        // 2. Cloud OCR via Gemini Flash API (mendukung JPG, PNG, dan PDF scan)
+        if (in_array($driver, ['auto', 'gemini'], true) && $geminiKey !== '' && in_array($resolvedMimeType, ['application/pdf', 'image/jpeg', 'image/png'], true)) {
             try {
-                return self::extractTextViaOcrSpace($filePath, $resolvedMimeType, $originalFilename, $ocrSpaceKey);
+                return self::extractTextViaGemini($filePath, $resolvedMimeType, $geminiKey);
             } catch (Throwable $e) {
-                $ocrSpaceError = $e->getMessage();
-                Log::warning('OCR.space API error: '.$ocrSpaceError);
+                $cloudError = $e->getMessage();
+                Log::warning('Gemini API OCR error: '.$cloudError);
 
-                if ($driver === 'ocrspace') {
-                    throw new RuntimeException('OCR.space gagal: '.$ocrSpaceError, previous: $e);
+                if ($driver === 'gemini') {
+                    throw new RuntimeException('Gemini OCR gagal: '.$cloudError, previous: $e);
                 }
             }
         }
 
-        // 3. Fallback ke Tesseract lokal jika tersedia di server/PC
+        // 3. Cloud OCR via OCR.space API (opsional cadangan jika key tersedia)
+        if (in_array($driver, ['auto', 'ocrspace'], true) && $ocrSpaceKey !== '') {
+            try {
+                return self::extractTextViaOcrSpace($filePath, $resolvedMimeType, $originalFilename, $ocrSpaceKey);
+            } catch (Throwable $e) {
+                $cloudError = $e->getMessage();
+                Log::warning('OCR.space API error: '.$cloudError);
+
+                if ($driver === 'ocrspace') {
+                    throw new RuntimeException('OCR.space gagal: '.$cloudError, previous: $e);
+                }
+            }
+        }
+
+        // 4. Fallback ke Tesseract lokal hanya jika fungsi shell aktif & binary tersedia
         if (in_array($driver, ['auto', 'tesseract'], true) && in_array($resolvedMimeType, ['image/jpeg', 'image/png'], true)) {
             if (self::canRunLocalTesseract()) {
                 $usedLocalTesseract = true;
@@ -542,23 +603,338 @@ class InboundInvoiceResource extends Resource
             }
         }
 
-        if ($ocrSpaceError !== null) {
-            throw new RuntimeException('Gagal memproses OCR via OCR.space: '.$ocrSpaceError);
+        if ($cloudError !== null) {
+            throw new RuntimeException('Gagal memproses OCR: '.$cloudError);
         }
 
         if ($resolvedMimeType === 'application/pdf') {
             throw new RuntimeException(
-                'PDF ini berupa hasil scan gambar (tidak berisi teks digital). Tambahkan OCR_SPACE_API_KEY di file .env agar PDF scan bisa dibaca otomatis.'
+                'PDF ini berupa hasil scan gambar (tidak berisi teks digital). Tambahkan GEMINI_API_KEY di file .env agar PDF scan bisa dibaca otomatis.'
             );
         }
 
         if (in_array($resolvedMimeType, ['image/jpeg', 'image/png'], true)) {
             throw new RuntimeException(
-                'Engine OCR gambar belum aktif. Tambahkan OCR_SPACE_API_KEY di file .env (rekomendasi untuk cPanel) atau install Tesseract OCR di server.'
+                'Engine OCR gambar belum aktif. Tambahkan GEMINI_API_KEY di file .env (rekomendasi untuk cPanel) agar foto faktur dapat diproses.'
             );
         }
 
         return '';
+    }
+
+    /**
+     * @return array{
+     *     parsed: array{
+     *         invoice_number: ?string,
+     *         issue_date: ?string,
+     *         due_date: ?string,
+     *         subtotal_amount: ?float,
+     *         total_amount: ?float,
+     *         items: list<array{item_name: string, quantity: int, unit: string, unit_price: float, subtotal: float}>
+     *     },
+     *     raw_text: string
+     * }
+     */
+    public static function extractInvoiceViaGemini(
+        string $filePath,
+        string $mimeType,
+        Supplier $supplier,
+        string $apiKey,
+    ): array {
+        $fileContents = file_get_contents($filePath);
+        if ($fileContents === false) {
+            throw new RuntimeException('Gagal membaca file faktur yang diunggah.');
+        }
+
+        $keywordHints = array_filter([
+            $supplier->ocr_invoice_keyword ? 'No. Faktur: "'.$supplier->ocr_invoice_keyword.'"' : null,
+            $supplier->ocr_date_keyword ? 'Tanggal: "'.$supplier->ocr_date_keyword.'"' : null,
+            $supplier->ocr_subtotal_keyword ? 'Subtotal: "'.$supplier->ocr_subtotal_keyword.'"' : null,
+            $supplier->ocr_total_keyword ? 'Total: "'.$supplier->ocr_total_keyword.'"' : null,
+        ]);
+
+        $hintSection = ! empty($keywordHints)
+            ? "\nPetunjuk label dari supplier ({$supplier->name}): ".implode(', ', $keywordHints).'.'
+            : '';
+
+        $prompt = <<<PROMPT
+Ekstrak data dari faktur pembelian Indonesia ini menjadi JSON murni tanpa penjelasan atau markdown.
+Perhatikan format angka Indonesia: titik (.) adalah pemisah ribuan, koma (,) sebelum 2 digit di akhir adalah desimal. Kembalikan semua nominal harga sebagai angka murni (contoh: 135440 atau 5866501).
+Jika nilai tidak ditemukan atau tidak terbaca jelas, isi null (atau array kosong [] untuk items).{$hintSection}
+
+Skema JSON wajib:
+{
+  "invoice_number": "string atau null",
+  "issue_date": "YYYY-MM-DD atau null",
+  "due_date": "YYYY-MM-DD atau null",
+  "subtotal_amount": 0,
+  "total_amount": 0,
+  "items": [
+    {
+      "item_name": "nama barang/produk",
+      "quantity": 1,
+      "unit": "Pcs/Kit/TST/Box/dll (default Pcs)",
+      "unit_price": 0,
+      "subtotal": 0
+    }
+  ],
+  "raw_text": "baris ringkas nomor faktur, tanggal, subtotal, dan total saja"
+}
+PROMPT;
+
+        $responseText = self::callGeminiApi([
+            [
+                'parts' => [
+                    ['text' => $prompt],
+                    [
+                        'inlineData' => [
+                            'mimeType' => $mimeType,
+                            'data' => base64_encode($fileContents),
+                        ],
+                    ],
+                ],
+            ],
+        ], $apiKey, expectJson: true);
+
+        $cleanedJson = trim($responseText);
+        if (preg_match('/^```(?:json)?\s*(.*?)\s*```$/is', $cleanedJson, $fenceMatches)) {
+            $cleanedJson = trim($fenceMatches[1]);
+        }
+
+        $decoded = json_decode($cleanedJson, true);
+        if (! is_array($decoded)) {
+            throw new RuntimeException('Format respons JSON dari Gemini tidak valid.');
+        }
+
+        $rawText = trim((string) ($decoded['raw_text'] ?? ''));
+
+        $invoiceNumberRaw = isset($decoded['invoice_number']) ? trim((string) $decoded['invoice_number']) : '';
+        $invoiceNumber = ($invoiceNumberRaw !== '' && ! in_array(strtolower($invoiceNumberRaw), ['null', '-'], true))
+            ? $invoiceNumberRaw
+            : null;
+
+        $issueDate = isset($decoded['issue_date']) && trim((string) $decoded['issue_date']) !== ''
+            ? self::parseIndonesianDate((string) $decoded['issue_date'])
+            : null;
+
+        $dueDate = null;
+        if ($issueDate !== null && $supplier->top_days > 0) {
+            $dueDate = date('Y-m-d', strtotime($issueDate.' + '.$supplier->top_days.' days'));
+        } elseif (isset($decoded['due_date']) && trim((string) $decoded['due_date']) !== '') {
+            $dueDate = self::parseIndonesianDate((string) $decoded['due_date']);
+        }
+
+        $subtotalAmount = self::normalizeGeminiAmount($decoded['subtotal_amount'] ?? null);
+        $totalAmount = self::normalizeGeminiAmount($decoded['total_amount'] ?? null);
+
+        $items = [];
+        foreach ($decoded['items'] ?? [] as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $itemName = trim((string) ($row['item_name'] ?? ''));
+            $quantity = (int) round((float) ($row['quantity'] ?? 0));
+            $unit = trim((string) ($row['unit'] ?? '')) ?: 'Pcs';
+            $unitPrice = self::normalizeGeminiAmount($row['unit_price'] ?? null) ?? 0.0;
+            $subtotal = self::normalizeGeminiAmount($row['subtotal'] ?? null) ?? 0.0;
+
+            if ($subtotal <= 0 && $quantity > 0 && $unitPrice > 0) {
+                $subtotal = round($quantity * $unitPrice);
+            } elseif ($unitPrice <= 0 && $quantity > 0 && $subtotal > 0) {
+                $unitPrice = round($subtotal / $quantity);
+            }
+
+            if ($itemName === '' || $quantity <= 0 || $unitPrice <= 0 || $subtotal <= 0) {
+                continue;
+            }
+
+            $items[] = [
+                'item_name' => $itemName,
+                'quantity' => $quantity,
+                'unit' => $unit,
+                'unit_price' => $unitPrice,
+                'subtotal' => $subtotal,
+            ];
+        }
+
+        $parsed = [
+            'invoice_number' => $invoiceNumber,
+            'issue_date' => $issueDate,
+            'due_date' => $dueDate,
+            'subtotal_amount' => $subtotalAmount,
+            'total_amount' => $totalAmount,
+            'items' => $items,
+        ];
+
+        if ($rawText !== '') {
+            $regexParsed = self::parseOcrInvoiceData($rawText, $supplier);
+            $parsed['invoice_number'] ??= $regexParsed['invoice_number'];
+            $parsed['issue_date'] ??= $regexParsed['issue_date'];
+            $parsed['due_date'] ??= $regexParsed['due_date'];
+            $parsed['subtotal_amount'] ??= $regexParsed['subtotal_amount'];
+            $parsed['total_amount'] ??= $regexParsed['total_amount'];
+
+            if (empty($parsed['items']) && ! empty($regexParsed['items'])) {
+                $parsed['items'] = $regexParsed['items'];
+            }
+        }
+
+        if ($parsed['due_date'] === null && $parsed['issue_date'] !== null && $supplier->top_days > 0) {
+            $parsed['due_date'] = date('Y-m-d', strtotime($parsed['issue_date'].' + '.$supplier->top_days.' days'));
+        }
+
+        return [
+            'parsed' => $parsed,
+            'raw_text' => $rawText !== '' ? $rawText : (json_encode($parsed, JSON_UNESCAPED_UNICODE) ?: ''),
+        ];
+    }
+
+    public static function extractTextViaGemini(string $filePath, string $mimeType, string $apiKey): string
+    {
+        $fileContents = file_get_contents($filePath);
+        if ($fileContents === false) {
+            throw new RuntimeException('Gagal membaca file faktur yang diunggah.');
+        }
+
+        return self::callGeminiApi([
+            [
+                'parts' => [
+                    ['text' => 'Transkripsikan seluruh teks dan tabel pada faktur ini secara akurat dalam teks polos tanpa penjelasan tambahan.'],
+                    [
+                        'inlineData' => [
+                            'mimeType' => $mimeType,
+                            'data' => base64_encode($fileContents),
+                        ],
+                    ],
+                ],
+            ],
+        ], $apiKey, expectJson: false);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $contents
+     */
+    public static function callGeminiApi(array $contents, string $apiKey, bool $expectJson = true): string
+    {
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(120);
+        }
+
+        $customEndpoint = trim((string) config('services.ocr.gemini_endpoint', ''));
+        $primaryModel = trim((string) config('services.ocr.gemini_model', 'gemini-3.5-flash-lite')) ?: 'gemini-3.5-flash-lite';
+
+        $candidateModels = $customEndpoint !== ''
+            ? [$primaryModel]
+            : array_values(array_unique([
+                $primaryModel,
+                'gemini-3.5-flash-lite',
+                'gemini-3.1-flash-lite',
+                'gemini-flash-lite-latest',
+                'gemini-3.6-flash',
+                'gemini-3.5-flash',
+            ]));
+
+        $payload = [
+            'contents' => $contents,
+        ];
+
+        if ($expectJson) {
+            $payload['generationConfig'] = [
+                'responseMimeType' => 'application/json',
+                'temperature' => 0.1,
+            ];
+        }
+
+        $lastError = 'Tidak dapat terhubung ke layanan Gemini API.';
+
+        foreach ($candidateModels as $index => $model) {
+            $endpoint = $customEndpoint !== ''
+                ? str_replace('{model}', $model, $customEndpoint)
+                : "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent";
+
+            try {
+                $response = Http::timeout(18)
+                    ->connectTimeout(5)
+                    ->withOptions(['force_ip_resolve' => 'v4'])
+                    ->withHeaders(['x-goog-api-key' => $apiKey])
+                    ->post($endpoint, $payload);
+            } catch (Throwable $e) {
+                $lastError = 'Koneksi ke Gemini API gagal: '.$e->getMessage();
+                Log::warning("Gemini connection error ({$model}): ".$e->getMessage());
+
+                if ($index < count($candidateModels) - 1) {
+                    continue;
+                }
+
+                throw new RuntimeException($lastError, previous: $e);
+            }
+
+            if ($response->successful()) {
+                $body = $response->json();
+                $parts = $body['candidates'][0]['content']['parts'] ?? [];
+                $textParts = [];
+
+                foreach ($parts as $part) {
+                    if (! is_array($part) || ! empty($part['thought'])) {
+                        continue;
+                    }
+
+                    $partText = trim((string) ($part['text'] ?? ''));
+                    if ($partText !== '') {
+                        $textParts[] = $partText;
+                    }
+                }
+
+                $combinedText = trim(implode("\n", $textParts));
+                if ($combinedText === '') {
+                    throw new RuntimeException('Gemini API tidak mengembalikan hasil pembacaan.');
+                }
+
+                return $combinedText;
+            }
+
+            $status = $response->status();
+            $apiMessage = (string) ($response->json('error.message') ?? '');
+
+            if ($status === 429) {
+                throw new RuntimeException('Kuota / rate limit Gemini API tercapai (HTTP 429). Tunggu 1 menit lalu klik Scan Ulang OCR atau isi manual.');
+            }
+
+            if (in_array($status, [401, 403], true)) {
+                throw new RuntimeException('GEMINI_API_KEY tidak valid atau tidak memiliki izin akses Gemini API (HTTP '.$status.').');
+            }
+
+            $lastError = 'HTTP '.$status.' dari Gemini API'.($apiMessage !== '' ? ': '.$apiMessage : '.');
+
+            // Retry with fallback model if model unavailable / high demand (404 / 503)
+            if (in_array($status, [404, 503], true) && $index < count($candidateModels) - 1) {
+                Log::warning("Gemini fallback from {$model} (HTTP {$status}): {$apiMessage}");
+
+                continue;
+            }
+
+            throw new RuntimeException($lastError);
+        }
+
+        throw new RuntimeException($lastError);
+    }
+
+    public static function normalizeGeminiAmount(mixed $value): ?float
+    {
+        if (is_int($value) || is_float($value)) {
+            $number = (float) $value;
+
+            return $number > 0 ? $number : null;
+        }
+
+        if (is_string($value) && trim($value) !== '') {
+            $parsed = self::parseIndonesianAmount($value);
+
+            return $parsed > 0 ? $parsed : null;
+        }
+
+        return null;
     }
 
     public static function extractTextViaOcrSpace(

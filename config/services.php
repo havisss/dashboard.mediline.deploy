@@ -37,6 +37,9 @@ return [
 
     'ocr' => [
         'driver' => env('OCR_DRIVER', 'auto'),
+        'gemini_api_key' => env('GEMINI_API_KEY'),
+        'gemini_model' => env('GEMINI_MODEL', 'gemini-3.5-flash-lite'),
+        'gemini_endpoint' => env('GEMINI_ENDPOINT'),
         'ocrspace_api_key' => env('OCR_SPACE_API_KEY'),
         'ocrspace_endpoint' => env('OCR_SPACE_ENDPOINT', 'https://api.ocr.space/parse/image'),
         'ocrspace_engine' => (int) env('OCR_SPACE_ENGINE', 2),
