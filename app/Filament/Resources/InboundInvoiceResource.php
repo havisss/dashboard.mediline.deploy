@@ -269,7 +269,16 @@ class InboundInvoiceResource extends Resource
 
                     if ($pdfText !== '') {
                         $text = $pdfText;
-                        $parsed = self::parseOcrInvoiceData($text, $supplier);
+                        $candidateParsed = self::parseOcrInvoiceData($text, $supplier);
+                        $hasMatchedPdfData = $candidateParsed['invoice_number'] !== null
+                            || $candidateParsed['issue_date'] !== null
+                            || $candidateParsed['subtotal_amount'] !== null
+                            || $candidateParsed['total_amount'] !== null
+                            || ! empty($candidateParsed['items']);
+
+                        if ($hasMatchedPdfData || $geminiKey === '' || $driver === 'tesseract') {
+                            $parsed = $candidateParsed;
+                        }
                     }
                 } catch (Throwable $e) {
                     Log::warning('PDF text extraction fallback to OCR: '.$e->getMessage());
